@@ -1,7 +1,7 @@
 use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
-use std::cell::{Cell,RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::os::raw::c_void;
 
@@ -10,6 +10,9 @@ mod sys;
 use self::sys::{ucontext_t, getcontext, setcontext, makecontext, swapcontext};
 use self::sys::{valloc, free};
 
+// `Stack` is a page-aligned region of memory suitable for use as a coroutine's stack.
+//
+// It's allocated using C `valloc()` and dropped using C `free()`.
 struct Stack {
     size: usize,
     ptr: *mut c_void,
@@ -37,15 +40,18 @@ impl Drop for Stack {
 
 /// A `Handle` is created for the outside of an asymmetric coroutine. It contains the suspended
 /// coroutine's thread state and the coroutine's stack.
-struct Handle<'f> {
+pub struct Handle<'f> {
     ctx: ucontext_t,
-    stack: Stack,
+
+    #[allow(dead_code)]
+    stack: Stack, // Rust doesn't see the stack get used, but it is referenced by `ctx`.
+
     link: Rc<Cell<Link>>,
     pd: PhantomData<&'f ()>
 }
 
 /// A `Coroutine` is created for the inside of an asymmetric coroutine's execution.
-struct Coroutine<'f> {
+pub struct Coroutine<'f> {
     f: Cell<Option<Box<CoroutineFn + 'f>>>,
     link: Rc<Cell<Link>>,
 }
@@ -61,7 +67,7 @@ enum Link {
 }
 
 impl<'f> Coroutine<'f> {
-    fn new<F>(f: F, stack_size: usize) -> Handle<'f>
+    pub fn new<F>(f: F, stack_size: usize) -> Handle<'f>
         where F: CoroutineFn + 'f
     {
         let stack = Stack::new(stack_size);
@@ -112,7 +118,7 @@ impl<'f> Coroutine<'f> {
 
     fn run(mut self) -> Rc<Cell<Link>> {
         let mut f = self.f.take().expect("f");
-        f.run_ucontext(&mut self);
+        f.call(&mut self);
 
         return self.link;
     }
@@ -136,8 +142,8 @@ impl<'f> Coroutine<'f> {
     }
 }
 
-trait CoroutineFn {
-    fn run_ucontext(&mut self, execution_context: &mut Coroutine);
+pub trait CoroutineFn {
+    fn call(&mut self, execution_context: &mut Coroutine);
 }
 
 unsafe extern "C" fn executioncontext_entrypoint(
@@ -161,7 +167,7 @@ unsafe extern "C" fn executioncontext_entrypoint(
     let link = Cell::new(Link::Terminated);
     link_cell.swap(&link);
     match link.into_inner() {
-        Link::Called { left, right } => {
+        Link::Called { left: _, right } => {
             setcontext(right);
             panic!("setcontext() failed");
         }
@@ -215,12 +221,12 @@ mod test {
 
         struct F1<'a>{ seq: &'a AtomicUsize };
         impl<'a> CoroutineFn for F1<'a> {
-            fn run_ucontext(&mut self, execution_context: &mut Coroutine) {
+            fn call(&mut self, coro: &mut Coroutine) {
                 // in coroutine (1 => 2)
                 assert_eq!(self.seq.load(Ordering::Acquire), 1);
                 self.seq.store(2, Ordering::Release);
 
-                execution_context.yield_back();
+                coro.yield_back();
 
                 // back in coroutine (3 => 4)
                 assert_eq!(self.seq.load(Ordering::Acquire), 3);
