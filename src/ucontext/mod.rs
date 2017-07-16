@@ -52,7 +52,7 @@ pub struct Handle<'f> {
 
 /// A `Coroutine` is created for the inside of an asymmetric coroutine's execution.
 pub struct Coroutine<'f> {
-    f: Cell<Option<Box<CoroutineFn + 'f>>>,
+    f: Cell<Option<Box<FnMut(&mut Coroutine) + 'f>>>,
     link: Rc<Cell<Link>>,
 }
 
@@ -68,7 +68,7 @@ enum Link {
 
 impl<'f> Coroutine<'f> {
     pub fn new<F>(f: F, stack_size: usize) -> Handle<'f>
-        where F: CoroutineFn + 'f
+        where F: FnMut(&mut Coroutine) + 'f
     {
         let stack = Stack::new(stack_size);
 
@@ -117,8 +117,8 @@ impl<'f> Coroutine<'f> {
     }
 
     fn run(mut self) -> Rc<Cell<Link>> {
-        let mut f = self.f.take().expect("f");
-        f.call(&mut self);
+        let mut f = self.f.take().expect("callback function");
+        f(&mut self);
 
         return self.link;
     }
@@ -140,10 +140,6 @@ impl<'f> Coroutine<'f> {
             }
         }
     }
-}
-
-pub trait CoroutineFn {
-    fn call(&mut self, execution_context: &mut Coroutine);
 }
 
 unsafe extern "C" fn executioncontext_entrypoint(
@@ -219,22 +215,18 @@ mod test {
     fn test_ucontext() {
         let seq = AtomicUsize::new(0);
 
-        struct F1<'a>{ seq: &'a AtomicUsize };
-        impl<'a> CoroutineFn for F1<'a> {
-            fn call(&mut self, coro: &mut Coroutine) {
-                // in coroutine (1 => 2)
-                assert_eq!(self.seq.load(Ordering::Acquire), 1);
-                self.seq.store(2, Ordering::Release);
+        let mut coro = Coroutine::new(|coro: &mut Coroutine| {
+            // in coroutine (1 => 2)
+            assert_eq!(seq.load(Ordering::Acquire), 1);
+            seq.store(2, Ordering::Release);
 
-                coro.yield_back();
+            coro.yield_back();
 
-                // back in coroutine (3 => 4)
-                assert_eq!(self.seq.load(Ordering::Acquire), 3);
-                self.seq.store(4, Ordering::Release);
-            }
-        }
+            // back in coroutine (3 => 4)
+            assert_eq!(seq.load(Ordering::Acquire), 3);
+            seq.store(4, Ordering::Release);
 
-        let mut coro = Coroutine::new(F1{seq: &seq}, 512*1024);
+        }, 512*1024);
 
         // sequence of events:
 
