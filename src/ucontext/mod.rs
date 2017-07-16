@@ -67,7 +67,14 @@ enum Link {
 }
 
 impl<'f> Coroutine<'f> {
-    pub fn new<F>(f: F, stack_size: usize) -> Handle<'f>
+    pub fn new<F>(f: F) -> Handle<'f>
+        where F: FnMut(&mut Coroutine) + 'f
+    {
+        Self::new_with_stack_size(f, 512*1024)
+    }
+
+
+    pub fn new_with_stack_size<F>(f: F, stack_size: usize) -> Handle<'f>
         where F: FnMut(&mut Coroutine) + 'f
     {
         let stack = Stack::new(stack_size);
@@ -123,7 +130,7 @@ impl<'f> Coroutine<'f> {
         return self.link;
     }
 
-    fn yield_back(&mut self) {
+    pub fn yield_back(&mut self) {
         let link = Cell::new(Link::Ready);
         self.link.swap(&link);
         match link.into_inner() {
@@ -225,8 +232,7 @@ mod test {
             // back in coroutine (3 => 4)
             assert_eq!(seq.load(Ordering::Acquire), 3);
             seq.store(4, Ordering::Release);
-
-        }, 512*1024);
+        });
 
         // sequence of events:
 
