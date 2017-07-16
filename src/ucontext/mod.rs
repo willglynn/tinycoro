@@ -38,8 +38,8 @@ impl Drop for Stack {
 // outside
 struct ThreadContext<'f> {
     ctx: ucontext_t,
-    stack: Option<Stack>,
-    link: Option<Rc<Cell<Link>>>,
+    stack: Stack,
+    link: Rc<Cell<Link>>,
     pd: PhantomData<&'f ()>,
 }
 
@@ -106,31 +106,13 @@ unsafe extern "C" fn executioncontext_entrypoint(
     }
 
     println!("setcontext()ing back");
-    unsafe {
-        setcontext(link.right);
-    }
+    setcontext(link.right);
     panic!("setcontext() failed");
 }
 
 impl<'f> ThreadContext<'f> {
-    // return a `Ucontext` representing the outside world
-    fn new() -> ThreadContext<'f> {
-        let mut ctx: ucontext_t;
-
-        unsafe {
-            ctx = mem::zeroed();
-        }
-
-        ThreadContext {
-            ctx: ctx,
-            stack: None,
-            link: None,
-            pd: PhantomData,
-        }
-    }
-
     // return a `Ucontext` that will call `f` when switched to
-    fn make<F>(f: F, stack_size: usize) -> ThreadContext<'f>
+    fn new<F>(f: F, stack_size: usize) -> ThreadContext<'f>
         where F: UcontextFn + 'f
     {
         let stack = Stack::new(stack_size);
@@ -167,41 +149,36 @@ impl<'f> ThreadContext<'f> {
         // assemble all this into a ThreadContext
         let mut new_context = ThreadContext{
             ctx,
-            stack: Some(stack),
-            link: Some(link),
+            stack,
+            link,
             pd: PhantomData,
         };
 
         // at this point, we've leaked ExecutionContext onto the heap
         // switch in so that executioncontext_entrypoint moves it back to the internal stack
         {
-            let current = ThreadContext::new();
             println!("swapping in");
-            new_context.switch_to(&current);
+            new_context.switch_to();
             println!("returning from constructor");
         }
 
         new_context
     }
 
-    pub fn switch_to(&mut self, previous: &ThreadContext) {
+    pub fn switch_to(&mut self) {
         unsafe {
             // set the link to come back here
-            if let Some(ref link) = self.link {
-                link.set(Link{
-                    left: &self.ctx as *const ucontext_t as _,
-                    right: &previous.ctx as *const ucontext_t as _,
-                });
-            } else {
-                panic!("can't switch to this thread context");
-            }
+            let here: ucontext_t = mem::uninitialized();
+            self.link.set(Link{
+                left: &self.ctx as *const ucontext_t as _,
+                right: &here as *const ucontext_t as _,
+            });
 
             // swap in
-            if swapcontext(&previous.ctx as *const ucontext_t as *mut ucontext_t, &self.ctx as *const ucontext_t) != 0 {
+            if swapcontext(&here as *const ucontext_t as *mut ucontext_t, &self.ctx as *const ucontext_t) != 0 {
                 // failed
                 panic!("swapcontext failed");
             }
-            println!("swapcontext returned");
         }
     }
 }
@@ -213,8 +190,6 @@ mod test {
 
     #[test]
     fn test_ucontext() {
-        let mut main = Rc::new(ThreadContext::new());
-
         let seq = AtomicUsize::new(0);
 
         struct F1<'a>{ seq: &'a AtomicUsize };
@@ -232,7 +207,7 @@ mod test {
             }
         }
 
-        let mut coro = ThreadContext::make(F1{seq: &seq}, 512*1024);
+        let mut coro = ThreadContext::new(F1{seq: &seq}, 512*1024);
 
         // sequence of events:
 
@@ -240,13 +215,13 @@ mod test {
         assert_eq!(seq.load(Ordering::Acquire), 0);
         seq.store(1, Ordering::Release);
 
-        coro.switch_to(&main);
+        coro.switch_to();
 
         // back from coroutine (2 => 3)
         assert_eq!(seq.load(Ordering::Acquire), 2);
         seq.store(3, Ordering::Release);
 
-        coro.switch_to(&main);
+        coro.switch_to();
 
         // done (4!)
         assert_eq!(seq.load(Ordering::Acquire), 4);
