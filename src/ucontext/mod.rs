@@ -37,10 +37,11 @@ impl Drop for Stack {
 
 /// A `Handle` is created for the outside of an asymmetric coroutine. It contains the suspended
 /// coroutine's thread state and the coroutine's stack.
-struct Handle {
+struct Handle<'f> {
     ctx: ucontext_t,
     stack: Stack,
     link: Rc<Cell<Link>>,
+    pd: PhantomData<&'f ()>
 }
 
 /// A `Coroutine` is created for the inside of an asymmetric coroutine's execution.
@@ -60,7 +61,7 @@ enum Link {
 }
 
 impl<'f> Coroutine<'f> {
-    fn new<F>(f: F, stack_size: usize) -> Handle
+    fn new<F>(f: F, stack_size: usize) -> Handle<'f>
         where F: CoroutineFn + 'f
     {
         let stack = Stack::new(stack_size);
@@ -99,6 +100,7 @@ impl<'f> Coroutine<'f> {
             ctx,
             stack,
             link,
+            pd: PhantomData,
         };
 
         // at this point, we've leaked the Coroutine onto the heap
@@ -169,7 +171,7 @@ unsafe extern "C" fn executioncontext_entrypoint(
     }
 }
 
-impl Handle {
+impl<'f> Handle<'f> {
     pub fn is_terminated(&self) -> bool {
         match self.link.get() {
             Link::Terminated => true,
