@@ -219,6 +219,28 @@ mod test {
     use std::sync::atomic::{Ordering,AtomicUsize};
 
     #[test]
+    fn test_create_destroy() {
+        let seq = AtomicUsize::new(0);
+
+        {
+            // create a coroutine
+            let mut coro = Coroutine::new(|_: &mut Coroutine| {
+                seq.store(1, Ordering::Release);
+            });
+
+            // don't ever actually call it
+            if false {
+                coro.yield_in();
+            }
+
+            // dropping without calling should not be an error
+        }
+
+        // ...and the value should remain unchanged
+        assert_eq!(seq.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn test_ucontext() {
         let seq = AtomicUsize::new(0);
 
