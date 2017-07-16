@@ -1,0 +1,11 @@
+[package]
+name = "tinycoro"
+version = "0.1.0"
+authors = ["Will Glynn <will@willglynn.com>"]
+build = "build.rs"
+
+[dependencies]
+libc = "*"
+
+[build-dependencies]
+bindgen = "0.26.3"
