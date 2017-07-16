@@ -36,15 +36,14 @@ impl Drop for Stack {
 }
 
 // outside
-struct ThreadContext<'f> {
+struct Handle {
     ctx: ucontext_t,
     stack: Stack,
     link: Rc<Cell<Link>>,
-    pd: PhantomData<&'f ()>,
 }
 
 // inside
-struct ExecutionContext<'f> {
+struct Coroutine<'f> {
     f: Cell<Option<Box<UcontextFn + 'f>>>,
     link: Rc<Cell<Link>>,
 }
@@ -64,7 +63,56 @@ impl Default for Link {
     }
 }
 
-impl<'f> ExecutionContext<'f> {
+impl<'f> Coroutine<'f> {
+    // return a `Ucontext` that will call `f` when switched to
+    fn new<F>(f: F, stack_size: usize) -> Handle
+        where F: UcontextFn + 'f
+    {
+        let stack = Stack::new(stack_size);
+
+        let mut ctx: ucontext_t = unsafe { mem::zeroed() };
+
+        // prepare a link, which we'll share with the ExecutionContext
+        let link: Rc<Cell<Link>> = Rc::new(Cell::new(Link::default()));
+
+        // prepare an Coroutine which we'll move into the context
+        let coro = Coroutine {
+            f: Cell::new(Some(Box::new(f))),
+            link: link.clone(),
+        };
+
+        unsafe {
+            getcontext(&mut ctx as *mut ucontext_t);
+
+            ctx.uc_stack.ss_sp = stack.ptr;
+            ctx.uc_stack.ss_size = stack.size as _;
+            ctx.uc_stack.ss_flags = 0;
+            ctx.uc_link = 0 as _;
+
+            let executioncontext_entrypoint: unsafe extern "C" fn(*mut Coroutine) = executioncontext_entrypoint;
+            let executioncontext_entrypoint: unsafe extern "C" fn() = mem::transmute(executioncontext_entrypoint);
+            makecontext(
+                &mut ctx as *mut ucontext_t,
+                Some(executioncontext_entrypoint),
+                1,
+                Box::into_raw(Box::new(coro)),
+            );
+        }
+
+        // assemble all the outer bits into the handle
+        let mut handle = Handle {
+            ctx,
+            stack,
+            link,
+        };
+
+        // at this point, we've leaked the Coroutine onto the heap
+        // switch in so that executioncontext_entrypoint moves it to its internal stack
+        handle.yield_in();
+
+        handle
+    }
+
     fn run(mut self) -> Link {
         let mut f = self.f.take().expect("f");
         f.run_ucontext(&mut self);
@@ -84,17 +132,17 @@ impl<'f> ExecutionContext<'f> {
 }
 
 trait UcontextFn {
-    fn run_ucontext(&mut self, execution_context: &mut ExecutionContext);
+    fn run_ucontext(&mut self, execution_context: &mut Coroutine);
 }
 
 unsafe extern "C" fn executioncontext_entrypoint(
-    execution_context: *mut ExecutionContext
+    execution_context: *mut Coroutine
 ) {
     let link: Link;
 
     {
         // move in the incoming ExecutionContext ptr
-        let mut execution_context: ExecutionContext = ptr::read(execution_context);
+        let mut execution_context: Coroutine = ptr::read(execution_context);
 
         // yield back, letting the constructor return
         execution_context.yield_back();
@@ -110,62 +158,8 @@ unsafe extern "C" fn executioncontext_entrypoint(
     panic!("setcontext() failed");
 }
 
-impl<'f> ThreadContext<'f> {
-    // return a `Ucontext` that will call `f` when switched to
-    fn new<F>(f: F, stack_size: usize) -> ThreadContext<'f>
-        where F: UcontextFn + 'f
-    {
-        let stack = Stack::new(stack_size);
-
-        let mut ctx: ucontext_t = unsafe { mem::zeroed() };
-
-        // prepare a link, which we'll share with the ExecutionContext
-        let link: Rc<Cell<Link>> = Rc::new(Cell::new(Link::default()));
-
-        // prepare an ExecutionContext which we'll move into the context
-        let execution_context = ExecutionContext{
-            f: Cell::new(Some(Box::new(f))),
-            link: link.clone(),
-        };
-
-        unsafe {
-            getcontext(&mut ctx as *mut ucontext_t);
-
-            ctx.uc_stack.ss_sp = stack.ptr;
-            ctx.uc_stack.ss_size = stack.size as _;
-            ctx.uc_stack.ss_flags = 0;
-            ctx.uc_link = 0 as _;
-
-            let executioncontext_entrypoint: unsafe extern "C" fn(*mut ExecutionContext) = executioncontext_entrypoint;
-            let executioncontext_entrypoint: unsafe extern "C" fn() = mem::transmute(executioncontext_entrypoint);
-            makecontext(
-                &mut ctx as *mut ucontext_t,
-                Some(executioncontext_entrypoint),
-                1,
-                Box::into_raw(Box::new(execution_context)),
-            );
-        }
-
-        // assemble all this into a ThreadContext
-        let mut new_context = ThreadContext{
-            ctx,
-            stack,
-            link,
-            pd: PhantomData,
-        };
-
-        // at this point, we've leaked ExecutionContext onto the heap
-        // switch in so that executioncontext_entrypoint moves it back to the internal stack
-        {
-            println!("swapping in");
-            new_context.switch_to();
-            println!("returning from constructor");
-        }
-
-        new_context
-    }
-
-    pub fn switch_to(&mut self) {
+impl Handle {
+    pub fn yield_in(&mut self) {
         unsafe {
             // set the link to come back here
             let here: ucontext_t = mem::uninitialized();
@@ -194,7 +188,7 @@ mod test {
 
         struct F1<'a>{ seq: &'a AtomicUsize };
         impl<'a> UcontextFn for F1<'a> {
-            fn run_ucontext(&mut self, execution_context: &mut ExecutionContext) {
+            fn run_ucontext(&mut self, execution_context: &mut Coroutine) {
                 // in coroutine (1 => 2)
                 assert_eq!(self.seq.load(Ordering::Acquire), 1);
                 self.seq.store(2, Ordering::Release);
@@ -207,7 +201,7 @@ mod test {
             }
         }
 
-        let mut coro = ThreadContext::new(F1{seq: &seq}, 512*1024);
+        let mut coro = Coroutine::new(F1{seq: &seq}, 512*1024);
 
         // sequence of events:
 
@@ -215,13 +209,13 @@ mod test {
         assert_eq!(seq.load(Ordering::Acquire), 0);
         seq.store(1, Ordering::Release);
 
-        coro.switch_to();
+        coro.yield_in();
 
         // back from coroutine (2 => 3)
         assert_eq!(seq.load(Ordering::Acquire), 2);
         seq.store(3, Ordering::Release);
 
-        coro.switch_to();
+        coro.yield_in();
 
         // done (4!)
         assert_eq!(seq.load(Ordering::Acquire), 4);
