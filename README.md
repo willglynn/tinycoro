@@ -35,6 +35,7 @@ This example covers essentially the entire API.
 
 You can share control of a single thread between one or more coroutine
 execution contexts. Each coroutine yields back to the normal thread stack.
+That's it.
 
 Non-features
 ------------
@@ -47,11 +48,16 @@ This crate does not have provisions for:
 Platform support
 ----------------
 
-Binding to `ucontext.h` covers:
+Binding to `ucontext.h` lets `tinycoro` target:
 
-* Mac OS X
-* Linux
+* Linux (tested by Travis)
+* Mac OS X (tested by Travis)
 * Other UNIXy systems
+
+`ucontext.h` specifies a POSIX standard C interface, but not standard
+concrete types. This crate therefore uses `bindgen` as part of its build
+process to generate Rust definitions matching the target system's C
+definitions. This implies a requirement for a recent `clang`.
 
 Windows has could also support this same user-facing API, but requires a
 separate implementation. Pull requests welcome.
