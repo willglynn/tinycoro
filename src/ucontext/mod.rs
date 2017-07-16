@@ -56,13 +56,19 @@ pub struct Coroutine<'f> {
     link: Rc<Cell<Link>>,
 }
 
+/// `Link` encapsulates the communication of shared state between `Coroutine` and `Handle`.
 #[derive(Copy,Clone,PartialEq,Eq)]
 enum Link {
+    /// Indicates the coroutine is ready to be called
     Ready,
+
+    /// Indicates the coroutine _was_ called, and provides ucontext_t's to which it should return.
     Called {
         left: *mut ucontext_t,
         right: *const ucontext_t,
     },
+
+    /// Indicates the coroutine is terminated and must not be called again.
     Terminated
 }
 
@@ -118,7 +124,7 @@ impl<'f> Coroutine<'f> {
 
         // at this point, we've leaked the Coroutine onto the heap
         // switch in so that executioncontext_entrypoint moves it to its internal stack
-        handle.yield_in();
+        handle.yield_in().expect("must not be terminated before first yield");
 
         handle
     }
@@ -181,6 +187,7 @@ unsafe extern "C" fn executioncontext_entrypoint(
 }
 
 impl<'f> Handle<'f> {
+    /// Indicates whether or not the coroutine has terminated.
     pub fn is_terminated(&self) -> bool {
         match self.link.get() {
             Link::Terminated => true,
@@ -188,12 +195,14 @@ impl<'f> Handle<'f> {
         }
     }
 
-    pub fn yield_in(&mut self) {
-        match self.link.get() {
-            Link::Terminated => {
-                return;
-            }
-            _ => ()
+    /// Yield control into the coroutine. This function blocks until either the coroutine calls
+    /// `Coroutine::yield_back()` or returns.
+    ///
+    /// Returns `Ok(still_running: bool)` on success, or `Err(())` if the coroutine could not be
+    /// called because it has already terminated.
+    pub fn yield_in(&mut self) -> Result<bool, ()> {
+        if self.is_terminated() {
+            return Err(());
         }
 
         unsafe {
@@ -209,6 +218,16 @@ impl<'f> Handle<'f> {
                 // failed
                 panic!("swapcontext failed");
             }
+        }
+
+        if self.is_terminated() {
+            // terminated
+            // TODO: free stack early?
+            Ok(false)
+
+        } else {
+            // still running
+            Ok(true)
         }
     }
 }
@@ -230,7 +249,7 @@ mod test {
 
             // don't ever actually call it
             if false {
-                coro.yield_in();
+                coro.yield_in().unwrap();
             }
 
             // dropping without calling should not be an error
@@ -263,14 +282,14 @@ mod test {
         assert_eq!(coro.is_terminated(), false);
         seq.store(1, Ordering::Release);
 
-        coro.yield_in();
+        coro.yield_in().unwrap();
 
         // back from coroutine (2 => 3)
         assert_eq!(seq.load(Ordering::Acquire), 2);
         assert_eq!(coro.is_terminated(), false);
         seq.store(3, Ordering::Release);
 
-        coro.yield_in();
+        coro.yield_in().unwrap();
 
         // done (4!)
         assert_eq!(seq.load(Ordering::Acquire), 4);

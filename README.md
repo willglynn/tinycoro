@@ -20,9 +20,9 @@ let mut handle = Coroutine::new(|coro: &mut Coroutine| {
 // handle.is_terminated() == false
 
 println!("1: in caller");
-handle.yield_in();
+handle.yield_in()?;    // == true
 println!("3: in caller");
-handle.yield_in();
+handle.yield_in()?;    // == false
 println!("5: terminated");
 
 // handle.is_terminated() == true
