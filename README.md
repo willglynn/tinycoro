@@ -3,9 +3,9 @@ tinycoro
 
 Tiny coroutines library, written in Rust.
 
-This crate does _not_ require nightly Rust, and will build today on stable
-Rust. Instead, it relies on coroutine-related platform features,
-particularly [`<ucontext.h>`](https://en.wikipedia.org/wiki/Setcontext).
+This crate uses FFI bindings to coroutine-related platform features instead
+of reimplementing coroutines in native Rust. This means that crate does
+_not_ require nightly; you can use it today on stable Rust.
 
 Example
 ------
@@ -47,8 +47,11 @@ This crate does not have provisions for:
 Platform support
 ----------------
 
-* Mac OS X (via `ucontext`)
-* Linux (via `ucontext`)
-* Other UNIXy systems (via `ucontext`)
+Binding to `ucontext.h` covers:
 
-Windows has could also support this same API. Pull requests welcome.
+* Mac OS X
+* Linux
+* Other UNIXy systems
+
+Windows has could also support this same user-facing API, but requires a
+separate implementation. Pull requests welcome.

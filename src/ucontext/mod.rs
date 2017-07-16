@@ -1,5 +1,4 @@
 use std::mem;
-use std::ptr;
 use std::marker::PhantomData;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -38,8 +37,12 @@ impl Drop for Stack {
     }
 }
 
-/// A `Handle` is created for the outside of an asymmetric coroutine. It contains the suspended
-/// coroutine's thread state and the coroutine's stack.
+/// A `Handle` is created for the outside of a coroutine. It contains the coroutine's thread state
+/// and the coroutine's stack.
+///
+/// # Safety
+///
+/// It's probably not a good idea to drop the `Handle` while the coroutine is running.
 pub struct Handle<'f> {
     ctx: ucontext_t,
 
@@ -50,7 +53,8 @@ pub struct Handle<'f> {
     pd: PhantomData<&'f ()>
 }
 
-/// A `Coroutine` is created for the inside of an asymmetric coroutine's execution.
+/// A `Coroutine` is created for the inside of a coroutine. It allows the coroutine to
+/// `yield_back()` control to its caller.
 pub struct Coroutine<'f> {
     link: Rc<Cell<Link>>,
     pd: PhantomData<&'f ()>
@@ -73,12 +77,18 @@ enum Link {
 }
 
 impl<'f> Coroutine<'f> {
+    /// Create a new `Coroutine`+`Handle` with a default stack size.
+    ///
+    /// The coroutine will call `f(&mut Coroutine)` when it starts.
     pub fn new<F>(f: F) -> Handle<'f>
         where F: FnOnce(&mut Coroutine) + 'f
     {
         Self::new_with_stack_size(f, 512*1024)
     }
-    
+
+    /// Create a new `Coroutine`+`Handle` with a specific stack size.
+    ///
+    /// The coroutine will call `f(&mut Coroutine)` when it starts.
     pub fn new_with_stack_size<F>(f: F, stack_size: usize) -> Handle<'f>
         where F: FnOnce(&mut Coroutine) + 'f
     {
@@ -86,29 +96,43 @@ impl<'f> Coroutine<'f> {
 
         let mut ctx: ucontext_t = unsafe { mem::zeroed() };
 
-        // prepare a link, which we'll share with the ExecutionContext
+        // prepare a link, which we'll share between the Handle and the Coroutine
         let link: Rc<Cell<Link>> = Rc::new(Cell::new(Link::Ready));
 
-        // prepare an Coroutine which we'll move into the context
+        // prepare a Coroutine
         let coro = Coroutine {
             link: link.clone(),
             pd: PhantomData
         };
 
-        // move `f` into an Option so we can take it in the entrypoint
+        // wrap `f` and `coro` into Option<_>s
+        let mut coro: Option<Coroutine> = Some(coro);
         let mut callback: Option<F> = Some(f);
 
-        // make a polymorphic entrypoint
-        unsafe extern "C" fn entrypoint<F>(coro: *mut Coroutine, f: *mut Option<F>)
+        // define a polymorphic C entrypoint suitable for this <F>
+        //
+        // the entrypoint takes pointers to the locals above, which obviously has lifetime issues
+        // therefore, the strategy is to:
+        //   - put coroutine data into locals on the constructor's stack
+        //   - yield into the coroutine
+        //   - have the entrypoint move data into the coroutine stack
+        //   - yield back
+        //   - return from the constructor
+        unsafe extern "C" fn entrypoint<F>(coro: *mut Option<Coroutine>, f: *mut Option<F>)
             where F: FnOnce(&mut Coroutine)
         {
-            {
-                // move in the incoming Coroutine ptr to our local stack
-                let mut coro: Coroutine = ptr::read(coro);
+            // take the constructor's Coroutine
+            let mut coro: Coroutine =
+                mem::transmute::<*mut Option<Coroutine>, &mut Option<Coroutine>>(coro)
+                .take()
+                .unwrap();
 
-                // take the callback
-                let f = mem::transmute::<*mut Option<F>, &mut Option<F>>(f).take();
-                let f = f.unwrap();
+            {
+                // take the constructor's function
+                let f: F =
+                    mem::transmute::<*mut Option<F>, &mut Option<F>>(f)
+                        .take()
+                        .unwrap();
 
                 // yield back, letting the constructor return
                 coro.yield_back();
@@ -116,26 +140,35 @@ impl<'f> Coroutine<'f> {
                 // run the function
                 f(&mut coro);
 
-                coro.terminate();
+                // drop the function
             }
+
+            // terminate the coroutine
+            coro.terminate();
         }
 
-
+        // express this plan in terms of <ucontext.h> API
         unsafe {
+            // initialize the context from right here, right now
             getcontext(&mut ctx as *mut ucontext_t);
 
+            // point it to the new stack
             ctx.uc_stack.ss_sp = stack.ptr;
             ctx.uc_stack.ss_size = stack.size as _;
             ctx.uc_stack.ss_flags = 0;
             ctx.uc_link = 0 as _;
 
-            let entrypoint: unsafe extern "C" fn(*mut Coroutine, *mut Option<F>) = entrypoint;
+            // makecontext() takes a C function() and separately asks for args
+            // this means we need to transmute into a no-arg function
+            let entrypoint: unsafe extern "C" fn(*mut Option<Coroutine>, *mut Option<F>) = entrypoint;
             let entrypoint: unsafe extern "C" fn() = mem::transmute(entrypoint);
+
+            // have the context run entrypoint(&mut coro, &mut f) when it starts
             makecontext(
                 &mut ctx as *mut ucontext_t,
                 Some(entrypoint),
                 2,
-                Box::into_raw(Box::new(coro)),
+                &mut coro as *mut Option<Coroutine>,
                 &mut callback as *mut Option<F>,
             );
         }
@@ -148,13 +181,21 @@ impl<'f> Coroutine<'f> {
             pd: PhantomData,
         };
 
-        // at this point, we've leaked the Coroutine onto the heap
-        // switch in so that executioncontext_entrypoint moves it to its internal stack
-        handle.yield_in().expect("must not be terminated before first yield");
+        // at this point, the Handle's `ctx` is ready to invoke entrypoint() with pointers to our
+        // local `coro` and `f` Option<_>s.
+        //
+        // yield into the coroutine, let it take the values out of `coro` and `f`, and yield back.
+        handle.yield_in().unwrap();
 
+        // the coroutine is now ready to invoke the user's function, and it shares no state except
+        // `link`.
+        //
+        // return to caller
         handle
     }
 
+    /// Yield control back to the caller. `Coroutine::yield_back()` will block until the caller
+    /// calls `Handle::yield_in()`.
     pub fn yield_back(&mut self) {
         let link = Cell::new(Link::Ready);
         self.link.swap(&link);
