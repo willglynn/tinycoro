@@ -35,45 +35,40 @@ impl Drop for Stack {
     }
 }
 
-// outside
+/// A `Handle` is created for the outside of an asymmetric coroutine. It contains the suspended
+/// coroutine's thread state and the coroutine's stack.
 struct Handle {
     ctx: ucontext_t,
     stack: Stack,
     link: Rc<Cell<Link>>,
 }
 
-// inside
+/// A `Coroutine` is created for the inside of an asymmetric coroutine's execution.
 struct Coroutine<'f> {
-    f: Cell<Option<Box<UcontextFn + 'f>>>,
+    f: Cell<Option<Box<CoroutineFn + 'f>>>,
     link: Rc<Cell<Link>>,
 }
 
-#[derive(Copy,Clone)]
-struct Link {
-    left: *mut ucontext_t,
-    right: *const ucontext_t,
-}
-
-impl Default for Link {
-    fn default() -> Self {
-        Link {
-            left: 0 as _,
-            right: 0 as _,
-        }
-    }
+#[derive(Copy,Clone,PartialEq,Eq)]
+enum Link {
+    Ready,
+    Called {
+        left: *mut ucontext_t,
+        right: *const ucontext_t,
+    },
+    Terminated
 }
 
 impl<'f> Coroutine<'f> {
-    // return a `Ucontext` that will call `f` when switched to
     fn new<F>(f: F, stack_size: usize) -> Handle
-        where F: UcontextFn + 'f
+        where F: CoroutineFn + 'f
     {
         let stack = Stack::new(stack_size);
 
         let mut ctx: ucontext_t = unsafe { mem::zeroed() };
 
         // prepare a link, which we'll share with the ExecutionContext
-        let link: Rc<Cell<Link>> = Rc::new(Cell::new(Link::default()));
+        let link: Rc<Cell<Link>> = Rc::new(Cell::new(Link::Ready));
 
         // prepare an Coroutine which we'll move into the context
         let coro = Coroutine {
@@ -113,32 +108,40 @@ impl<'f> Coroutine<'f> {
         handle
     }
 
-    fn run(mut self) -> Link {
+    fn run(mut self) -> Rc<Cell<Link>> {
         let mut f = self.f.take().expect("f");
         f.run_ucontext(&mut self);
 
-        return self.link.get();
+        return self.link;
     }
 
     fn yield_back(&mut self) {
-        let link = self.link.get();
-        unsafe {
-            if swapcontext(link.left, link.right) != 0 {
-                // failed
-                panic!("swapcontext failed");
+        let link = Cell::new(Link::Ready);
+        self.link.swap(&link);
+        match link.into_inner() {
+            Link::Called { left, right } => {
+                unsafe {
+                    if swapcontext(left, right) != 0 {
+                        // failed
+                        panic!("swapcontext failed");
+                    }
+                }
+            }
+            _ => {
+                panic!("don't know where to yield back to");
             }
         }
     }
 }
 
-trait UcontextFn {
+trait CoroutineFn {
     fn run_ucontext(&mut self, execution_context: &mut Coroutine);
 }
 
 unsafe extern "C" fn executioncontext_entrypoint(
     execution_context: *mut Coroutine
 ) {
-    let link: Link;
+    let link_cell: Rc<Cell<Link>>;
 
     {
         // move in the incoming ExecutionContext ptr
@@ -148,22 +151,44 @@ unsafe extern "C" fn executioncontext_entrypoint(
         execution_context.yield_back();
 
         // run the execution context until it returns our final link
-        link = execution_context.run();
+        link_cell = execution_context.run();
 
         // drop the execution context
     }
 
-    println!("setcontext()ing back");
-    setcontext(link.right);
-    panic!("setcontext() failed");
+    let link = Cell::new(Link::Terminated);
+    link_cell.swap(&link);
+    match link.into_inner() {
+        Link::Called { left, right } => {
+            setcontext(right);
+            panic!("setcontext() failed");
+        }
+        _ => {
+            panic!("coroutine is complete but cannot return to caller");
+        }
+    }
 }
 
 impl Handle {
+    pub fn is_terminated(&self) -> bool {
+        match self.link.get() {
+            Link::Terminated => true,
+            _ => false,
+        }
+    }
+
     pub fn yield_in(&mut self) {
+        match self.link.get() {
+            Link::Terminated => {
+                return;
+            }
+            _ => ()
+        }
+
         unsafe {
             // set the link to come back here
             let here: ucontext_t = mem::uninitialized();
-            self.link.set(Link{
+            self.link.set(Link::Called{
                 left: &self.ctx as *const ucontext_t as _,
                 right: &here as *const ucontext_t as _,
             });
@@ -187,7 +212,7 @@ mod test {
         let seq = AtomicUsize::new(0);
 
         struct F1<'a>{ seq: &'a AtomicUsize };
-        impl<'a> UcontextFn for F1<'a> {
+        impl<'a> CoroutineFn for F1<'a> {
             fn run_ucontext(&mut self, execution_context: &mut Coroutine) {
                 // in coroutine (1 => 2)
                 assert_eq!(self.seq.load(Ordering::Acquire), 1);
@@ -207,17 +232,20 @@ mod test {
 
         // nothing (0 => 1)
         assert_eq!(seq.load(Ordering::Acquire), 0);
+        assert_eq!(coro.is_terminated(), false);
         seq.store(1, Ordering::Release);
 
         coro.yield_in();
 
         // back from coroutine (2 => 3)
         assert_eq!(seq.load(Ordering::Acquire), 2);
+        assert_eq!(coro.is_terminated(), false);
         seq.store(3, Ordering::Release);
 
         coro.yield_in();
 
         // done (4!)
         assert_eq!(seq.load(Ordering::Acquire), 4);
+        assert_eq!(coro.is_terminated(), true);
     }
 }
