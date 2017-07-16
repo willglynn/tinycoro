@@ -52,8 +52,8 @@ pub struct Handle<'f> {
 
 /// A `Coroutine` is created for the inside of an asymmetric coroutine's execution.
 pub struct Coroutine<'f> {
-    f: Cell<Option<Box<FnMut(&mut Coroutine) + 'f>>>,
     link: Rc<Cell<Link>>,
+    pd: PhantomData<&'f ()>
 }
 
 /// `Link` encapsulates the communication of shared state between `Coroutine` and `Handle`.
@@ -74,14 +74,13 @@ enum Link {
 
 impl<'f> Coroutine<'f> {
     pub fn new<F>(f: F) -> Handle<'f>
-        where F: FnMut(&mut Coroutine) + 'f
+        where F: FnOnce(&mut Coroutine) + 'f
     {
         Self::new_with_stack_size(f, 512*1024)
     }
-
-
+    
     pub fn new_with_stack_size<F>(f: F, stack_size: usize) -> Handle<'f>
-        where F: FnMut(&mut Coroutine) + 'f
+        where F: FnOnce(&mut Coroutine) + 'f
     {
         let stack = Stack::new(stack_size);
 
@@ -92,9 +91,35 @@ impl<'f> Coroutine<'f> {
 
         // prepare an Coroutine which we'll move into the context
         let coro = Coroutine {
-            f: Cell::new(Some(Box::new(f))),
             link: link.clone(),
+            pd: PhantomData
         };
+
+        // move `f` into an Option so we can take it in the entrypoint
+        let mut callback: Option<F> = Some(f);
+
+        // make a polymorphic entrypoint
+        unsafe extern "C" fn entrypoint<F>(coro: *mut Coroutine, f: *mut Option<F>)
+            where F: FnOnce(&mut Coroutine)
+        {
+            {
+                // move in the incoming Coroutine ptr to our local stack
+                let mut coro: Coroutine = ptr::read(coro);
+
+                // take the callback
+                let f = mem::transmute::<*mut Option<F>, &mut Option<F>>(f).take();
+                let f = f.unwrap();
+
+                // yield back, letting the constructor return
+                coro.yield_back();
+
+                // run the function
+                f(&mut coro);
+
+                coro.terminate();
+            }
+        }
+
 
         unsafe {
             getcontext(&mut ctx as *mut ucontext_t);
@@ -104,13 +129,14 @@ impl<'f> Coroutine<'f> {
             ctx.uc_stack.ss_flags = 0;
             ctx.uc_link = 0 as _;
 
-            let executioncontext_entrypoint: unsafe extern "C" fn(*mut Coroutine) = executioncontext_entrypoint;
-            let executioncontext_entrypoint: unsafe extern "C" fn() = mem::transmute(executioncontext_entrypoint);
+            let entrypoint: unsafe extern "C" fn(*mut Coroutine, *mut Option<F>) = entrypoint;
+            let entrypoint: unsafe extern "C" fn() = mem::transmute(entrypoint);
             makecontext(
                 &mut ctx as *mut ucontext_t,
-                Some(executioncontext_entrypoint),
-                1,
+                Some(entrypoint),
+                2,
                 Box::into_raw(Box::new(coro)),
+                &mut callback as *mut Option<F>,
             );
         }
 
@@ -127,13 +153,6 @@ impl<'f> Coroutine<'f> {
         handle.yield_in().expect("must not be terminated before first yield");
 
         handle
-    }
-
-    fn run(mut self) -> Rc<Cell<Link>> {
-        let mut f = self.f.take().expect("callback function");
-        f(&mut self);
-
-        return self.link;
     }
 
     pub fn yield_back(&mut self) {
@@ -153,35 +172,23 @@ impl<'f> Coroutine<'f> {
             }
         }
     }
-}
 
-unsafe extern "C" fn executioncontext_entrypoint(
-    execution_context: *mut Coroutine
-) {
-    let link_cell: Rc<Cell<Link>>;
-
-    {
-        // move in the incoming ExecutionContext ptr
-        let mut execution_context: Coroutine = ptr::read(execution_context);
-
-        // yield back, letting the constructor return
-        execution_context.yield_back();
-
-        // run the execution context until it returns our final link
-        link_cell = execution_context.run();
-
-        // drop the execution context
-    }
-
-    let link = Cell::new(Link::Terminated);
-    link_cell.swap(&link);
-    match link.into_inner() {
-        Link::Called { left: _, right } => {
-            setcontext(right);
-            panic!("setcontext() failed");
-        }
-        _ => {
-            panic!("coroutine is complete but cannot return to caller");
+    /// Terminate the coroutine.
+    ///
+    /// # Safety
+    ///
+    /// Never returns.
+    unsafe fn terminate(&mut self) {
+        let link = Cell::new(Link::Terminated);
+        self.link.swap(&link);
+        match link.into_inner() {
+            Link::Called { left: _, right } => {
+                setcontext(right);
+                panic!("setcontext() failed");
+            }
+            _ => {
+                panic!("coroutine is complete but cannot return to caller");
+            }
         }
     }
 }
