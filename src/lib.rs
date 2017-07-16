@@ -12,13 +12,16 @@ mod tests {
             println!("2: in coroutine");
             coro.yield_back();
             println!("4: in coroutine");
+
         });
+        assert!(!handle.is_terminated());
 
         println!("1: in caller");
         handle.yield_in();
         println!("3: in caller");
         handle.yield_in();
         println!("5: terminated!");
+
         assert!(handle.is_terminated());
     }
 }
